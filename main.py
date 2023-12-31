@@ -14,12 +14,10 @@ from torch import nn, optim
 from torchvision import datasets, transforms
 
 
-
 NUM_BATCHES_TO_LOG = 10
 LOG_IMAGES_PER_BATCH = 32
 
-
-
+#WANDB SETUP
 def wandb_setup():
     wandb.login()
     wandb.init(
@@ -28,6 +26,7 @@ def wandb_setup():
     )
 
 
+#NET
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
@@ -47,7 +46,6 @@ class Net(nn.Module):
         return F.log_softmax(x, dim=1)
 
 
-
 def mnist_dataloader(batch_size, train=True, **kwargs):
     return torch.utils.data.DataLoader(
         datasets.MNIST(
@@ -62,6 +60,8 @@ def mnist_dataloader(batch_size, train=True, **kwargs):
     )
 
 
+
+#TRAIN
 def train(model, device, train_loader, optimizer, epoch, log_interval):
     model.train()
 
@@ -111,6 +111,50 @@ def log_test_predictions(images, labels, outputs, predicted, my_table, log_count
 
 
 
+#EVALUATION
+def test(model, device, test_loader):
+    # ``wandb`` tabular columns
+    columns = ["id", "image", "guess", "truth"]
+    for digit in range(10):
+        columns.append("score_" + str(digit))
+    my_table = wandb.Table(columns=columns)
+
+    model.eval()
+
+    # hooks into the model to collect gradients and the topology
+    wandb.watch(model)
+
+    test_loss = 0
+    correct = 0
+    log_counter = 0
+
+    # disable gradient
+    with torch.no_grad():
+
+        # loop through the test data loader
+        for images, targets in test_loader:
+            images, targets = images.to(device), targets.to(device)  # device conversion
+            outputs = model(images)  # forward pass -- generate predictions
+            test_loss += F.nll_loss(outputs, targets, reduction="sum").item()  # sum up batch loss
+            _, predicted = torch.max(outputs.data, 1)  # get the index of the max log-probability
+            correct += (predicted == targets).sum().item()  # compare predictions to true label
+
+            # log predictions to the ``wandb`` table
+            if log_counter < NUM_BATCHES_TO_LOG:
+                log_test_predictions(images, targets, outputs, predicted, my_table, log_counter)
+                log_counter += 1
+
+    # compute the average loss
+    test_loss /= len(test_loader.dataset)
+
+    print("\naccuracy={:.4f}\n".format(float(correct) / len(test_loader.dataset)))
+    accuracy = float(correct) / len(test_loader.dataset)
+
+    # log the average loss, accuracy, and table
+    wandb.log({"test_loss": test_loss, "accuracy": accuracy, "mnist_predictions": my_table})
+
+    return accuracy
+
 @dataclass_json
 @dataclass
 class Hyperparameters(object):
@@ -131,10 +175,11 @@ class Hyperparameters(object):
     seed: int = 1
     log_interval: int = 10
     batch_size: int = 64
-
     test_batch_size: int = 1000
     epochs: int = 10
     learning_rate: float = 0.01
+
+
 
 
 TrainingOutputs = typing.NamedTuple(
@@ -142,8 +187,6 @@ TrainingOutputs = typing.NamedTuple(
     epoch_accuracies=typing.List[float],
     model_state=PythonPickledFile,
 )
-
-
 
 if os.getenv("SANDBOX") != "":
     print(f"SANDBOX ENV: '{os.getenv('SANDBOX')}'")
@@ -166,6 +209,8 @@ else:
     requests=Resources(gpu=gpu, mem=mem, storage=storage),
     limits=Resources(gpu=gpu, mem=mem, storage=storage),
 )
+
+
 def pytorch_mnist_task(hp: Hyperparameters) -> TrainingOutputs:
     wandb_setup()
 
@@ -175,8 +220,6 @@ def pytorch_mnist_task(hp: Hyperparameters) -> TrainingOutputs:
     # set random seed
     torch.manual_seed(hp.seed)
 
-    # ideally, if GPU training is required, and if cuda is not available, we can raise an exception
-    # however, as we want this algorithm to work locally as well (and most users don't have a GPU locally), we will fallback to using a CPU
     use_cuda = torch.cuda.is_available()
     print(f"Use cuda {use_cuda}")
     device = torch.device("cuda" if use_cuda else "cpu")
@@ -191,21 +234,15 @@ def pytorch_mnist_task(hp: Hyperparameters) -> TrainingOutputs:
 
     optimizer = optim.SGD(model.parameters(), lr=hp.learning_rate, momentum=hp.sgd_momentum)
 
-    # run multiple epochs and capture the accuracies for each epoch
-    # train the model: run multiple epochs and capture the accuracies for each epoch
     accuracies = []
     for epoch in range(1, hp.epochs + 1):
         train(model, device, training_data_loader, optimizer, epoch, hp.log_interval)
         accuracies.append(test(model, device, test_data_loader))
 
-    # after training the model, we can simply save it to disk and return it from the Flyte task as a {py:class}`flytekit.types.file.FlyteFile`
-    # type, which is the ``PythonPickledFile``. ``PythonPickledFile`` is simply a decorator on the ``FlyteFile`` that records the format
-    # of the serialized model as ``pickled``
     model_file = "mnist_cnn.pt"
     torch.save(model.state_dict(), model_file)
 
     return TrainingOutputs(epoch_accuracies=accuracies, model_state=PythonPickledFile(model_file))
-    
 
 
 @workflow
@@ -214,5 +251,5 @@ def pytorch_training_wf(hp: Hyperparameters = Hyperparameters(epochs=10, batch_s
 
 
 if __name__ == "__main__":
-    model, accuracies = pytorch_training_wf(hp=Hyperparameters(epochs=10, batch_size=128))
-    print(f"Model: {model}, Accuracies: {accuracies}")
+model, accuracies = pytorch_training_wf(hp=Hyperparameters(epochs=10, batch_size=128))
+print(f"Model: {model}, Accuracies: {accuracies}")
